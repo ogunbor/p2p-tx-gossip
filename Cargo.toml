@@ -13,3 +13,5 @@ libp2p = { version = "0.55.0", features = [
 ] }
 tokio = { version = "1", features = ["full"] }
 async-std = "1.12.0"
+solana-client = "2.1.11"
+solana-sdk = "2.1.11"

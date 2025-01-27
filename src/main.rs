@@ -1,19 +1,40 @@
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::{
+    instruction::Instruction,
+    message::Message,
+    pubkey::Pubkey,
+    signature::{Keypair, Signer},
+    system_instruction,
+    transaction::Transaction,
+};
+use std::error::Error;
+
 use libp2p::{
     core::upgrade,
     gossipsub::{Gossipsub, GossipsubConfig, GossipsubEvent, IdentTopic, MessageAuthenticity},
     identity,
     mdns::{Mdns, MdnsConfig, MdnsEvent},
-    noise::{Keypair, NoiseConfig, X25519Spec},
+    noise::{Keypair as NoiseKeypair, NoiseConfig, X25519Spec},
     swarm::{Swarm, SwarmBuilder, SwarmEvent},
     tcp::TokioTcpConfig,
-    tokio,
     yamux::YamuxConfig,
     Multiaddr, NetworkBehaviour, PeerId, Transport,
 };
-use std::error::Error;
+
+mod solana_tx;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // Create and print a dummy transaction
+    match solana_tx::create_dummy_transaction().await {
+        Ok(tx) => {
+            println!("Dummy Transaction Created: {:?}", tx);
+        }
+        Err(err) => {
+            eprintln!("Failed to create transaction: {}", err);
+        }
+    }
+
     // Generate an identity keypair for the node
     let id_keys = identity::Keypair::generate_ed25519();
     let peer_id = PeerId::from(id_keys.public());
@@ -43,7 +64,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let behaviour = MyBehaviour { gossipsub, mdns };
 
     // Set up the transport
-    let noise_keys = Keypair::<X25519Spec>::new().into_authentic(&id_keys)?;
+    let noise_keys = NoiseKeypair::<X25519Spec>::new().into_authentic(&id_keys)?;
     let transport = TokioTcpConfig::new()
         .upgrade(upgrade::Version::V1)
         .authenticate(NoiseConfig::xx(noise_keys).into_authenticated())
@@ -64,11 +85,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Event loop
     loop {
         match swarm.select_next_some().await {
-            SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(GossipsubEvent::Message {
+            SwarmEvent::Behaviour(libp2p::gossipsub::GossipsubEvent::Message {
                 propagation_source,
                 message_id,
                 message,
-            })) => {
+            }) => {
                 println!(
                     "Received message: {:?} with ID: {:?} from peer: {:?}",
                     String::from_utf8_lossy(&message.data),
@@ -76,7 +97,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     propagation_source
                 );
             }
-            SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(MdnsEvent::Discovered(peers))) => {
+            SwarmEvent::Behaviour(MdnsEvent::Discovered(peers)) => {
                 for (peer, _addr) in peers {
                     swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
                 }
@@ -86,5 +107,51 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             _ => {}
         }
+    }
+}
+
+/// Solana Transaction Helper Module
+pub mod solana_tx {
+    use solana_client::rpc_client::RpcClient;
+    use solana_sdk::{
+        instruction::Instruction,
+        message::Message,
+        pubkey::Pubkey,
+        signature::{Keypair, Signer},
+        system_instruction,
+        transaction::Transaction,
+    };
+    use std::error::Error;
+
+    /// Creates a dummy transaction on the Solana blockchain
+    pub async fn create_dummy_transaction() -> Result<Transaction, Box<dyn Error>> {
+        // Connect to Solana devnet
+        let client = RpcClient::new("https://api.devnet.solana.com");
+
+        // Generate a dummy keypair (payer)
+        let payer = Keypair::new();
+        println!("Generated Payer Address: {}", payer.pubkey());
+
+        // Define the recipient address (for simplicity, using a random public key)
+        let recipient = Pubkey::new_unique();
+        println!("Recipient Address: {}", recipient);
+
+        // Create a transfer instruction
+        let transfer_instruction = system_instruction::transfer(
+            &payer.pubkey(),
+            &recipient,
+            1_000_000, // Transfer 0.001 SOL
+        );
+
+        // Create a message from the transfer instruction
+        let message = Message::new(&[transfer_instruction], Some(&payer.pubkey()));
+
+        // Get the latest blockhash
+        let recent_blockhash = client.get_latest_blockhash()?;
+
+        // Build the transaction with the payer and the recent blockhash
+        let transaction = Transaction::new(&[&payer], message, recent_blockhash);
+
+        Ok(transaction)
     }
 }
