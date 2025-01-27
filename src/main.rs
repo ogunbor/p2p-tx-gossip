@@ -1,14 +1,3 @@
-use solana_client::rpc_client::RpcClient;
-use solana_sdk::{
-    instruction::Instruction,
-    message::Message,
-    pubkey::Pubkey,
-    signature::{Keypair, Signer},
-    system_instruction,
-    transaction::Transaction,
-};
-use std::error::Error;
-
 use libp2p::{
     core::upgrade,
     gossipsub::{Gossipsub, GossipsubConfig, GossipsubEvent, IdentTopic, MessageAuthenticity},
@@ -20,27 +9,47 @@ use libp2p::{
     yamux::YamuxConfig,
     Multiaddr, NetworkBehaviour, PeerId, Transport,
 };
+use serde::{Deserialize, Serialize};
+use serde_json;
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::{
+    instruction::Instruction,
+    message::Message,
+    pubkey::Pubkey,
+    signature::{Keypair, Signer},
+    system_instruction,
+    transaction::Transaction,
+};
+use std::error::Error; // For serializing and deserializing transactions
 
 mod solana_tx;
 
+// Struct to track peer information (e.g., peer_id, number of transactions)
+#[derive(Serialize, Deserialize, Debug)]
+pub struct PeerInfo {
+    pub peer_id: PeerId,
+    pub transactions_sent: usize,
+}
+
+// Struct to track transactions
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TransactionMessage {
+    pub peer_id: PeerId,
+    pub transaction: Transaction,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Create and print a dummy transaction
-    match solana_tx::create_dummy_transaction().await {
-        Ok(tx) => {
-            println!("Dummy Transaction Created: {:?}", tx);
-        }
-        Err(err) => {
-            eprintln!("Failed to create transaction: {}", err);
-        }
-    }
-
     // Generate an identity keypair for the node
     let id_keys = identity::Keypair::generate_ed25519();
     let peer_id = PeerId::from(id_keys.public());
     println!("Local peer id: {:?}", peer_id);
 
-    // Create Gossipsub configuration
+    // Create a dummy transaction
+    let tx = solana_tx::create_dummy_transaction().await?;
+    println!("Dummy Transaction Created: {:?}", tx);
+
+    // Create a Gossipsub configuration
     let gossipsub_config = GossipsubConfig::default();
     let mut gossipsub = Gossipsub::new(
         MessageAuthenticity::Signed(id_keys.clone()),
@@ -82,6 +91,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let addr: Multiaddr = "/ip4/0.0.0.0/tcp/0".parse()?;
     Swarm::listen_on(&mut swarm, addr)?;
 
+    // Create distributed tables for peers and transactions
+    let mut peers_table = std::collections::HashMap::new();
+    let mut transactions_table = std::collections::HashMap::new();
+
     // Event loop
     loop {
         match swarm.select_next_some().await {
@@ -90,12 +103,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 message_id,
                 message,
             }) => {
-                println!(
-                    "Received message: {:?} with ID: {:?} from peer: {:?}",
-                    String::from_utf8_lossy(&message.data),
-                    message_id,
-                    propagation_source
-                );
+                // Deserialize the received message into a TransactionMessage
+                let received_msg: TransactionMessage = match serde_json::from_slice(&message.data) {
+                    Ok(msg) => msg,
+                    Err(_) => {
+                        println!("Failed to deserialize message");
+                        continue;
+                    }
+                };
+
+                // Update the transactions table with the received transaction
+                transactions_table.insert(received_msg.peer_id, received_msg.transaction.clone());
+
+                // Update the peers table (this can include additional peer metadata)
+                if let Some(peer_info) = peers_table.get_mut(&received_msg.peer_id) {
+                    peer_info.transactions_sent += 1;
+                } else {
+                    peers_table.insert(
+                        received_msg.peer_id.clone(),
+                        PeerInfo {
+                            peer_id: received_msg.peer_id,
+                            transactions_sent: 1,
+                        },
+                    );
+                }
+
+                // Print updated peer and transaction tables
+                println!("Updated Peers Table: {:?}", peers_table);
+                println!("Updated Transactions Table: {:?}", transactions_table);
             }
             SwarmEvent::Behaviour(MdnsEvent::Discovered(peers)) => {
                 for (peer, _addr) in peers {
@@ -107,51 +142,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             _ => {}
         }
-    }
-}
 
-/// Solana Transaction Helper Module
-pub mod solana_tx {
-    use solana_client::rpc_client::RpcClient;
-    use solana_sdk::{
-        instruction::Instruction,
-        message::Message,
-        pubkey::Pubkey,
-        signature::{Keypair, Signer},
-        system_instruction,
-        transaction::Transaction,
-    };
-    use std::error::Error;
+        // Send a transaction across peers
+        let tx_message = TransactionMessage {
+            peer_id: peer_id.clone(),
+            transaction: tx.clone(),
+        };
+        let serialized_message = serde_json::to_vec(&tx_message)?;
 
-    /// Creates a dummy transaction on the Solana blockchain
-    pub async fn create_dummy_transaction() -> Result<Transaction, Box<dyn Error>> {
-        // Connect to Solana devnet
-        let client = RpcClient::new("https://api.devnet.solana.com");
+        gossipsub.publish(&topic, serialized_message)?;
 
-        // Generate a dummy keypair (payer)
-        let payer = Keypair::new();
-        println!("Generated Payer Address: {}", payer.pubkey());
-
-        // Define the recipient address (for simplicity, using a random public key)
-        let recipient = Pubkey::new_unique();
-        println!("Recipient Address: {}", recipient);
-
-        // Create a transfer instruction
-        let transfer_instruction = system_instruction::transfer(
-            &payer.pubkey(),
-            &recipient,
-            1_000_000, // Transfer 0.001 SOL
-        );
-
-        // Create a message from the transfer instruction
-        let message = Message::new(&[transfer_instruction], Some(&payer.pubkey()));
-
-        // Get the latest blockhash
-        let recent_blockhash = client.get_latest_blockhash()?;
-
-        // Build the transaction with the payer and the recent blockhash
-        let transaction = Transaction::new(&[&payer], message, recent_blockhash);
-
-        Ok(transaction)
+        // Add some delay to prevent sending transactions too frequently
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     }
 }
