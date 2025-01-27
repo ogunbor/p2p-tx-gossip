@@ -1,0 +1,15 @@
+[package]
+name = "p2p-tx-gossip"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libp2p = { version = "0.55.0", features = [
+    "tcp-tokio",
+    "gossipsub",
+    "mdns",
+    "dns-tokio",
+    "tokio",
+] }
+tokio = { version = "1", features = ["full"] }
+async-std = "1.12.0"
